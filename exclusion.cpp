@@ -11,24 +11,6 @@ using namespace RcppParallel;
 
 // ---------------- Helpers ----------------
 
-// Hamming distance between two equal-length ranges
-template <typename Iter1, typename Iter2>
-inline int hamming_distance_iter(Iter1 begin1, Iter1 end1, Iter2 begin2) {
-    int dist = 0;
-    while (begin1 != end1) {
-        if (*begin1++ != *begin2++) dist++;
-    }
-    return dist;
-}
-
-// Non-negative modulo in [0, m-1]
-inline int mod_nonneg(int a, int m) {
-    if (m <= 0) return 0;
-    int r = a % m;
-    if (r < 0) r += m;
-    return r;
-}
-
 // central exclusion window as bases (1-based in spec, 0-based internally)
 inline void compute_exclusion_base_range(int len, int exclusion_half_width_bases, int &E0, int &E1){
     if (exclusion_half_width_bases <= 0){ E0 = 1; E1 = 0; return; } // empty interval
@@ -49,7 +31,7 @@ inline char at_spliced(const std::vector<char>& s, int u_spliced, int E0, int ga
     return s[ map_spliced_to_original(u_spliced, E0, gapLen) ];
 }
 
-// Hamming over spliced ranges (can jump across the gap seamlessly)
+// Hamming over spliced ranges 
 inline int hamming_distance_spliced(const std::vector<char>& A, int a0,
                                     const std::vector<char>& B, int b0,
                                     int k, int E0, int gapLen){
@@ -61,7 +43,6 @@ inline int hamming_distance_spliced(const std::vector<char>& A, int a0,
 }
 
 // Finds min distance between k-mers at equivalent positions (same start)
-// (spliced coordinate; returns 1-based ORIGINAL start, like your original)
 struct MinHammingResult {
     int position; // 1-based index for R compatibility
     int distance;
@@ -101,6 +82,7 @@ MinHammingResult find_min_hamming_equivalent_cpp_spliced(
 }
 
 // ---------------- Worker ----------------
+// Parallelization
 
 struct DissimilarityWorkerRevised : public Worker {
     // Inputs
@@ -185,8 +167,6 @@ struct DissimilarityWorkerRevised : public Worker {
                 } else if (k <= Ls) {
                     // fallback: window not usable, reuse basic distance and position
                     min_window_dist = res.distance;
-                    // map spliced pos from basic: res.position is ORIGINAL 1-based -> convert to spliced if needed
-                    // For penalty we only need ORIGINAL; we'll derive from res.position below when needed.
                     pos_i_best_sp = 0;
                     pos_j_best_sp = 0;
                     have_best = true;
@@ -205,9 +185,7 @@ struct DissimilarityWorkerRevised : public Worker {
                     pos_j_best_sp = 0;
                 }
 
-                
-                // penalty is Mod(pos_i - pos_j, window_size) ∈ [0, window_size-1]  
-                
+                // penalty is |pos_i - pos_j| (absolute difference on original coordinates)
                 int pos_i_best_orig0 = map_spliced_to_original(pos_i_best_sp, E0, gapLen);
                 int pos_j_best_orig0 = map_spliced_to_original(pos_j_best_sp, E0, gapLen);
                 int penalty = std::abs(pos_i_best_orig0 - pos_j_best_orig0);
@@ -216,8 +194,6 @@ struct DissimilarityWorkerRevised : public Worker {
                 if (window_size >= 2) {
                     adjusted = static_cast<double>(min_window_dist) * static_cast<double>(window_size - 1)
                                + static_cast<double>(penalty);
-                    
-                    //            + static_cast<double>(penalty);
                 } else {
                     // window_size == 0 or 1: no offset allowed, keep raw distance
                     adjusted = static_cast<double>(min_window_dist);
