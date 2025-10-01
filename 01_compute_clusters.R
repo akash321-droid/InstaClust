@@ -1,28 +1,77 @@
-# --- Libraries (lean) ---
-library(Biostrings)
-library(Rcpp)
-library(RcppParallel)
-library(dynamicTreeCut)
-library(cluster)   # for silhouette
+#!/usr/bin/env Rscript
 
-# --- Parameters (keep your variable names) ---
-fasta_file  <- "data/CONTENT_consensus_pmut_0.00_Hmean_1.3841_dHnorm_0.0000.fasta"
-k           <- 10
-window_size <- 10
-exclusion_half_width_bases = 0  # Keeps a window
+# --- Libraries (silent) ---
+suppressPackageStartupMessages({
+  library(Biostrings)
+  library(Rcpp)
+  library(RcppParallel)
+  library(dynamicTreeCut)
+  library(cluster)   
+})
 
-# --- Source the C++ dissimilarity code ---
-Rcpp::sourceCpp("exclusion.cpp")  # provides calculate_window_dissimilarity_revised_cpp_parallel()
+# --- CLI parameters (mandatory fasta, k, window; optional excl=0) ---
+args <- commandArgs(trailingOnly = TRUE)
+
+# tiny --key=val parser
+kv <- if (length(args)) {
+  parts <- strsplit(args, "=", fixed = TRUE)
+  setNames(vapply(parts, `[`, "", 2L), vapply(parts, `[`, "", 1L))
+} else character()
+
+# usage helper
+usage <- function() {
+  cat("Usage:\n",
+      "  Rscript clustering.R --fasta=FILE --k=INT --window=INT [--excl=INT]\n",
+      "  Required: --fasta, --k, --window\n",
+      "  Optional: --excl (default 0)\n", sep = "")
+}
+
+# helper
+if (!is.na(kv["--help"]) || any(args %in% c("-h", "--help"))) {
+  usage(); quit(status = 0)
+}
+
+# validate presence
+if (is.na(kv["--fasta"]))  stop("Missing required argument: --fasta=<file>\n", call. = FALSE)
+if (is.na(kv["--k"]))      stop("Missing required argument: --k=<integer>\n", call. = FALSE)
+if (is.na(kv["--window"])) stop("Missing required argument: --window=<integer>\n", call. = FALSE)
+
+# assign + validate type
+fasta_file <- kv["--fasta"]
+
+k <- as.integer(kv["--k"])
+if (is.na(k) || k < 1) stop("`--k` must be a positive integer\n", call. = FALSE)
+
+window_size <- as.integer(kv["--window"])
+if (is.na(window_size) || window_size < 1) stop("`--window` must be a positive integer\n", call. = FALSE)
+
+exclusion_half_width_bases <- if (!is.na(kv["--excl"])) as.integer(kv["--excl"]) else 0
+if (is.na(exclusion_half_width_bases) || exclusion_half_width_bases < 0)
+  stop("`--excl` must be a non-negative integer (default 0)\n", call. = FALSE)
+
+# --- Mini logger (timestamps) ---
+stamp <- function(fmt, ...) {
+  cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")),
+      sprintf(fmt, ...), "\n", sep = "")
+}
+
+stamp("Params => fasta=%s | k=%d | window=%d | excl=%d",
+      fasta_file, k, window_size, exclusion_half_width_bases)
+
+# --- Sourcing the C++ code for computing dissimilarity matrix  ---
+suppressMessages(Rcpp::sourceCpp("exclusion.cpp"))  # provides calculate_window_dissimilarity_revised_cpp_parallel()
 
 # --- Read sequences ---
+stamp("Reading FASTA: %s", fasta_file)
 dna_sequences <- readDNAStringSet(fasta_file)
 seq_list <- as.character(dna_sequences)
 n <- length(seq_list)
-
-# For ARI calculation of the sample data
-# true_labels <- rep(1:5, each = 2000)
+stamp("Loaded %d sequences", n)
 
 # --- Compute dissimilarities (C++) ---
+stamp("Computing dissimilarities in C++ (k=%d, window=%d, excl=%d) ...",
+      k, window_size, exclusion_half_width_bases)
+t0 <- proc.time()
 seq_list_for_cpp <- as.list(seq_list)
 
 result_cpp <- calculate_window_dissimilarity_revised_cpp_parallel(
@@ -31,14 +80,19 @@ result_cpp <- calculate_window_dissimilarity_revised_cpp_parallel(
   window_size = window_size,
   exclusion_half_width_bases = exclusion_half_width_bases
 )
+stamp("Dissimilarities done in %.1f sec", (proc.time() - t0)[["elapsed"]])
 
 # Primary dissimilarity matrix and dist object
 window_diss_matrix <- result_cpp[["window_dissimilarity_matrix"]]
 basic_diss_matrix  <- result_cpp[["basic_dissimilarity_matrix"]]
-window_diss_dist  <- as.dist(window_diss_matrix)
+stamp("Building dist object ...")
+window_diss_dist <- as.dist(window_diss_matrix)
 
 # --- Hierarchical clustering ---
+stamp("Running hclust (average) ...")
+t_hc <- proc.time()
 hc <- hclust(window_diss_dist, method = "average")
+stamp("hclust done in %.1f sec", (proc.time() - t_hc)[["elapsed"]])
 
 # --- Minimal auto_minClusterSize: mean silhouette plateau; else global max ---
 auto_minClusterSize <- function(step = 0.025, max_frac = 0.5,
@@ -65,23 +119,28 @@ auto_minClusterSize <- function(step = 0.025, max_frac = 0.5,
 
     keep <- which(lab > 0L)
     k <- if (length(keep)) length(unique(lab[keep])) else 0L
-    if (length(keep) < 3L || k < 2L)  # not enough for silhouette
+    if (length(keep) < 3L || k < 2L)
       return(c(ms = ms, k = k, mean_sil = NA_real_))
 
-    # Each cluster needs >=2 members
     if (any(table(lab[keep]) < 2L))
       return(c(ms = ms, k = k, mean_sil = NA_real_))
 
-    # Subset distance for assigned cells only
-    Dk <- as.dist(as.matrix(window_diss_dist)[
-      keep, keep, drop = FALSE
-    ])
+    Dk <- as.dist(as.matrix(window_diss_dist)[keep, keep, drop = FALSE])
     sil <- cluster::silhouette(lab[keep], Dk)
     mean_sil <- mean(sil[, "sil_width"], na.rm = TRUE)
     c(ms = ms, k = k, mean_sil = mean_sil)
   }
 
-  scores_mat <- t(sapply(sizes, eval_ms))
+  stamp("Scanning minClusterSize grid (%d candidates) ...", length(sizes))
+  pb <- txtProgressBar(min = 1, max = length(sizes), style = 3)
+  scores_mat <- matrix(NA_real_, nrow = length(sizes), ncol = 3)
+  for (i in seq_along(sizes)) {
+    scores_mat[i, ] <- eval_ms(sizes[i])
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+
+  colnames(scores_mat) <- c("ms", "k", "mean_sil")
   scores <- data.frame(
     minClusterSize   = as.integer(scores_mat[, "ms"]),
     k                = as.integer(scores_mat[, "k"]),
@@ -101,19 +160,21 @@ auto_minClusterSize <- function(step = 0.025, max_frac = 0.5,
 
   pick <- which(stable & scores$k >= 2L)[1]
   if (is.na(pick)) {
-    # Fallback: global maximum (treat NA as -Inf)
     pick <- which.max(replace(y, is.na(y), -Inf))
   }
 
+  stamp("Chosen minClusterSize = %d", scores$minClusterSize[pick])
   list(
     best_minClusterSize = scores$minClusterSize[pick],
     trace = scores
   )
 }
 
+# --- Setting the minClusterSize to auto ---
 res <- auto_minClusterSize()
 
-# --- Final clustering via cutreeHybrid  ---
+# --- Final clustering via cutreeHybrid ---
+stamp("Cutting tree with cutreeHybrid ...")
 clusters <- cutreeHybrid(
   dendro = hc,
   distM  = window_diss_matrix,
@@ -121,17 +182,18 @@ clusters <- cutreeHybrid(
   deepSplit = 1,
   pamRespectsDendro = FALSE
 )
-
 cluster_labels <- clusters$labels
-cat("Number of clusters identified:", max(cluster_labels, na.rm = TRUE), "\n")
-print(table(cluster_labels))
+stamp("Identified %d clusters", max(cluster_labels, na.rm = TRUE))
+
+# Optional: quick cluster size table (concise)
+tbl <- table(cluster_labels)
+print(tbl)
 
 # --- Save for (OLO + heatmap) ---
+stamp("Saving clustering_core.RData ...")
 save(list = c(
   "fasta_file","k","window_size",
   "seq_list","basic_diss_matrix","window_diss_dist","hc",
   "clusters","cluster_labels","res"
-  # ,"true_labels"  # keep if you use it elsewhere
 ), file = "clustering_core.RData")
-
-message("Saved: clustering_core.RData")
+stamp("Saved: clustering_core.RData")
